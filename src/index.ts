@@ -1,18 +1,23 @@
 /**
- * Sowel Recipe: Schedule On/Off
+ * Sowel Recipe: Schedule On/Off (v2 — sun-aware)
  *
  * Drives one or more on/off equipments on a fixed daily schedule. Up to three
- * windows per day; each window has a start time (fires ON) and an end time
- * (fires OFF). Every selected equipment receives the same ON/OFF orders.
+ * windows per day; each window has a start (fires ON) and an end (fires OFF).
+ * Every selected equipment receives the same ON/OFF orders.
  *
- * At each start the recipe fires `executeOrder(id, "state", "ON")` for every
- * equipment, at each end `"OFF"`. End times earlier than their start cross
- * midnight naturally: `msUntilTime` schedules each timer independently and the
- * timer re-arms itself for the next day after it fires.
+ * Each boundary (start or end) is one of:
+ *  - **Fixed time** — a literal `"HH:MM"`.
+ *  - **Sunrise** / **Sunset** — today's sun time (spec 023 offsets) plus a
+ *    per-boundary minute offset (e.g. sunset minus 15).
  *
- * Stopping the instance cancels every timer and leaves the equipments untouched
- * (no forced OFF). Disabling an automation should not actuate devices; if the
- * user wants the equipment off, they switch it off themselves.
+ * Sun times come from `ctx.helpers.getSunlight()` (spec 126). They drift a few
+ * minutes per day, so the recipe re-arms its sun-based timers whenever the
+ * engine emits `sunlight.changed` (new day / daylight transition). On a day
+ * with no sunrise/sunset (polar regions → null), the affected boundary is
+ * skipped for that day and re-armed when the sun data comes back.
+ *
+ * Stopping the instance cancels every timer and leaves the equipments
+ * untouched (no forced OFF).
  */
 
 // ============================================================
@@ -23,21 +28,29 @@ interface RecipeSlotDef {
   id: string;
   name: string;
   description: string;
-  type: "zone" | "equipment" | "number" | "duration" | "time" | "boolean" | "text" | "data-key";
+  type:
+    | "zone"
+    | "equipment"
+    | "number"
+    | "duration"
+    | "time"
+    | "boolean"
+    | "text"
+    | "data-key"
+    | "select";
   required: boolean;
   list?: boolean;
   defaultValue?: unknown;
-  constraints?: {
-    equipmentType?: string | string[];
-    min?: number;
-    max?: number;
-  };
+  options?: { value: string; label: string }[];
+  hiddenWhen?: { slot: string; equals: string | string[] };
+  constraints?: { equipmentType?: string | string[]; min?: number; max?: number };
   group?: string;
 }
 
 interface RecipeSlotI18n {
   name: string;
   description: string;
+  options?: Record<string, string>;
 }
 
 interface RecipeLangPack {
@@ -58,10 +71,7 @@ interface RecipeDefinition {
   slots: RecipeSlotDef[];
   i18n?: Record<string, RecipeLangPack>;
   validate(params: Record<string, unknown>, ctx: RecipeContext): void;
-  createInstance(
-    params: Record<string, unknown>,
-    ctx: RecipeContext,
-  ): RecipeInstanceHandle;
+  createInstance(params: Record<string, unknown>, ctx: RecipeContext): RecipeInstanceHandle;
 }
 
 interface Equipment {
@@ -87,6 +97,12 @@ interface EquipmentManager {
   ): Promise<{ success: boolean; error?: string }>;
 }
 
+interface Sunlight {
+  sunrise: string | null;
+  sunset: string | null;
+  isDaylight: boolean | null;
+}
+
 interface RecipeContext {
   eventBus: { onType(type: string, handler: (event: unknown) => void): () => void };
   equipmentManager: EquipmentManager;
@@ -99,20 +115,27 @@ interface RecipeContext {
   };
   state: RecipeStateStore;
   log: (message: string, level?: "info" | "warn" | "error") => void;
-  helpers: { parseDuration(value: unknown): number };
+  helpers: { parseDuration(value: unknown): number; getSunlight(): Sunlight };
 }
 
 // ============================================================
-// Slot model
+// Boundary model
 // ============================================================
+
+type BoundaryKind = "time" | "sunrise" | "sunset";
+
+interface Boundary {
+  kind: BoundaryKind;
+  time: string | null; // "HH:MM" when kind === "time"
+  offset: number; // minutes, applied to sunrise/sunset
+}
 
 interface Window {
   index: number; // 1..3
-  start: string; // "HH:MM"
-  end: string; // "HH:MM"
+  start: Boundary;
+  end: Boundary;
 }
 
-/** On/off equipment types this recipe can drive (state ON/OFF order). */
 const SUPPORTED_TYPES = [
   "switch",
   "light_onoff",
@@ -120,6 +143,12 @@ const SUPPORTED_TYPES = [
   "light_color",
   "water_valve",
   "pool_pump",
+];
+
+const KIND_OPTIONS = [
+  { value: "time", label: "Fixed time" },
+  { value: "sunrise", label: "Sunrise" },
+  { value: "sunset", label: "Sunset" },
 ];
 
 // ============================================================
@@ -141,20 +170,14 @@ function isValidHHMM(s: unknown): s is string {
   return typeof s === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
 }
 
-function windowLabel(w: Window): string {
-  return `${w.start}-${w.end}`;
-}
-
-function buildWindows(params: Record<string, unknown>): Window[] {
-  const windows: Window[] = [];
-  for (const n of [1, 2, 3]) {
-    const start = params[`slot${n}_start`];
-    const end = params[`slot${n}_end`];
-    if (isValidHHMM(start) && isValidHHMM(end)) {
-      windows.push({ index: n, start, end });
-    }
-  }
-  return windows;
+/** Shift an "HH:MM" by a signed minute offset, wrapping at midnight. */
+export function applyOffset(hhmm: string, offsetMin: number): string {
+  const [h, m] = hhmm.split(":").map(Number);
+  let total = h * 60 + m + (Number.isFinite(offsetMin) ? offsetMin : 0);
+  total = ((total % 1440) + 1440) % 1440;
+  const H = Math.floor(total / 60);
+  const M = total % 60;
+  return `${String(H).padStart(2, "0")}:${String(M).padStart(2, "0")}`;
 }
 
 /** Normalize an equipment slot value (list or single) to a clean id array. */
@@ -164,19 +187,96 @@ export function toIdList(value: unknown): string[] {
   return [String(value)];
 }
 
+function asKind(value: unknown): BoundaryKind {
+  return value === "sunrise" || value === "sunset" ? value : "time";
+}
+
+function asOffset(value: unknown): number {
+  const n = typeof value === "number" ? value : parseInt(String(value ?? ""), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** A boundary is "configured" when it can yield a time: a fixed HH:MM, or any
+ *  sun kind (resolvable later from getSunlight). */
+function boundaryConfigured(b: Boundary): boolean {
+  return b.kind === "time" ? isValidHHMM(b.time) : true;
+}
+
+function readBoundary(params: Record<string, unknown>, prefix: string): Boundary {
+  const kind = asKind(params[`${prefix}_kind`]);
+  const time = isValidHHMM(params[`${prefix}_time`]) ? (params[`${prefix}_time`] as string) : null;
+  return { kind, time, offset: asOffset(params[`${prefix}_offset`]) };
+}
+
+function buildWindows(params: Record<string, unknown>): Window[] {
+  const windows: Window[] = [];
+  for (const n of [1, 2, 3]) {
+    const start = readBoundary(params, `slot${n}_start`);
+    const end = readBoundary(params, `slot${n}_end`);
+    if (boundaryConfigured(start) && boundaryConfigured(end)) {
+      windows.push({ index: n, start, end });
+    }
+  }
+  return windows;
+}
+
+function boundaryLabel(b: Boundary): string {
+  if (b.kind === "time") return b.time ?? "??:??";
+  const sign = b.offset > 0 ? `+${b.offset}` : b.offset < 0 ? `${b.offset}` : "";
+  const name = b.kind === "sunrise" ? "lever" : "coucher";
+  return `${name}${sign ? ` ${sign}min` : ""}`;
+}
+
+function windowLabel(w: Window): string {
+  return `${boundaryLabel(w.start)} → ${boundaryLabel(w.end)}`;
+}
+
 // ============================================================
 // Slot definitions
 // ============================================================
 
-function buildSlots(): RecipeSlotDef[] {
+function boundarySlots(n: number, which: "start" | "end"): RecipeSlotDef[] {
+  const prefix = `slot${n}_${which}`;
+  const group = `slot${n}`;
+  const required = n === 1; // only window 1 is mandatory
+  const head = which === "start" ? "Start" : "End";
   return [
     {
-      id: "zone",
-      name: "Zone",
-      description: "Zone the equipments belong to",
-      type: "zone",
-      required: true,
+      id: `${prefix}_kind`,
+      name: head,
+      description: `${head}: fixed time, sunrise or sunset`,
+      type: "select",
+      required,
+      defaultValue: "time",
+      options: KIND_OPTIONS,
+      group,
     },
+    {
+      id: `${prefix}_time`,
+      name: `${head} time`,
+      description: "Used when the type is Fixed time",
+      type: "time",
+      required: false,
+      hiddenWhen: { slot: `${prefix}_kind`, equals: ["sunrise", "sunset"] },
+      group,
+    },
+    {
+      id: `${prefix}_offset`,
+      name: "Offset +/- (min)",
+      description: "Minutes before (-) or after (+) sunrise/sunset",
+      type: "number",
+      required: false,
+      defaultValue: 0,
+      hiddenWhen: { slot: `${prefix}_kind`, equals: "time" },
+      constraints: { min: -180, max: 180 },
+      group,
+    },
+  ];
+}
+
+function buildSlots(): RecipeSlotDef[] {
+  return [
+    { id: "zone", name: "Zone", description: "Zone the equipments belong to", type: "zone", required: true },
     {
       id: "equipments",
       name: "Equipments",
@@ -186,60 +286,12 @@ function buildSlots(): RecipeSlotDef[] {
       list: true,
       constraints: { equipmentType: SUPPORTED_TYPES },
     },
-
-    // Slot 1 — required
-    {
-      id: "slot1_start",
-      name: "Start",
-      description: "Turn-on time",
-      type: "time",
-      required: true,
-      group: "slot1",
-    },
-    {
-      id: "slot1_end",
-      name: "End",
-      description: "Turn-off time",
-      type: "time",
-      required: true,
-      group: "slot1",
-    },
-
-    // Slot 2 — optional pair
-    {
-      id: "slot2_start",
-      name: "Start",
-      description: "Turn-on time",
-      type: "time",
-      required: false,
-      group: "slot2",
-    },
-    {
-      id: "slot2_end",
-      name: "End",
-      description: "Turn-off time",
-      type: "time",
-      required: false,
-      group: "slot2",
-    },
-
-    // Slot 3 — optional pair
-    {
-      id: "slot3_start",
-      name: "Start",
-      description: "Turn-on time",
-      type: "time",
-      required: false,
-      group: "slot3",
-    },
-    {
-      id: "slot3_end",
-      name: "End",
-      description: "Turn-off time",
-      type: "time",
-      required: false,
-      group: "slot3",
-    },
+    ...boundarySlots(1, "start"),
+    ...boundarySlots(1, "end"),
+    ...boundarySlots(2, "start"),
+    ...boundarySlots(2, "end"),
+    ...boundarySlots(3, "start"),
+    ...boundarySlots(3, "end"),
   ];
 }
 
@@ -247,28 +299,36 @@ function buildSlots(): RecipeSlotDef[] {
 // i18n
 // ============================================================
 
+function boundaryI18n(which: "start" | "end"): Record<string, RecipeSlotI18n> {
+  const head = which === "start" ? "Début" : "Fin";
+  const out: Record<string, RecipeSlotI18n> = {};
+  for (const n of [1, 2, 3]) {
+    const prefix = `slot${n}_${which}`;
+    out[`${prefix}_kind`] = {
+      name: head,
+      description: `${head} : heure fixe, lever ou coucher du soleil`,
+      options: { time: "Heure fixe", sunrise: "Lever du soleil", sunset: "Coucher du soleil" },
+    };
+    out[`${prefix}_time`] = { name: `Heure ${head.toLowerCase()}`, description: "Utilisée si le type est Heure fixe" };
+    out[`${prefix}_offset`] = {
+      name: "Décalage +/- (min)",
+      description: "Minutes avant (-) ou après (+) le lever/coucher",
+    };
+  }
+  return out;
+}
+
 const FR: RecipeLangPack = {
   name: "Programmation horaire",
   description:
-    "Plages horaires marche/arrêt pour des équipements on/off, jusqu'à 3 créneaux par jour",
+    "Plages horaires marche/arrêt pour des équipements on/off : heure fixe, lever ou coucher du soleil, jusqu'à 3 créneaux par jour",
   slots: {
     zone: { name: "Zone", description: "Zone des équipements" },
-    equipments: {
-      name: "Équipements",
-      description: "Équipements on/off à piloter sur les créneaux",
-    },
-    slot1_start: { name: "Début", description: "Heure de mise en marche" },
-    slot1_end: { name: "Fin", description: "Heure d'arrêt" },
-    slot2_start: { name: "Début", description: "Heure de mise en marche" },
-    slot2_end: { name: "Fin", description: "Heure d'arrêt" },
-    slot3_start: { name: "Début", description: "Heure de mise en marche" },
-    slot3_end: { name: "Fin", description: "Heure d'arrêt" },
+    equipments: { name: "Équipements", description: "Équipements on/off à piloter sur les créneaux" },
+    ...boundaryI18n("start"),
+    ...boundaryI18n("end"),
   },
-  groups: {
-    slot1: "Créneau 1",
-    slot2: "Créneau 2",
-    slot3: "Créneau 3",
-  },
+  groups: { slot1: "Créneau 1", slot2: "Créneau 2", slot3: "Créneau 3" },
 };
 
 // ============================================================
@@ -280,41 +340,30 @@ export function createRecipe(): RecipeDefinition {
     id: "schedule-on-off",
     name: "Schedule On/Off",
     description:
-      "Scheduled on/off for any on/off equipment, up to 3 daily time windows",
+      "Scheduled on/off for any on/off equipment: fixed time, sunrise or sunset, up to 3 daily windows",
     slots: buildSlots(),
     i18n: { fr: FR },
 
     validate(params) {
-      if (!params.zone) {
-        throw new Error("Zone is required");
-      }
+      if (!params.zone) throw new Error("Zone is required");
       if (toIdList(params.equipments).length === 0) {
         throw new Error("At least one equipment is required");
       }
 
-      // Slot 1 must be complete.
-      if (!params.slot1_start || !params.slot1_end) {
-        throw new Error("Slot 1 start and end are required");
+      const w1Start = readBoundary(params, "slot1_start");
+      const w1End = readBoundary(params, "slot1_end");
+      if (!boundaryConfigured(w1Start) || !boundaryConfigured(w1End)) {
+        throw new Error("Slot 1 start and end are required (a fixed time, or sunrise/sunset)");
       }
 
       // Slots 2 and 3: start and end come as a pair.
       for (const n of [2, 3]) {
-        const start = params[`slot${n}_start`];
-        const end = params[`slot${n}_end`];
-        if (start && !end) {
-          throw new Error(`Slot ${n} end is required when start is set`);
-        }
-        if (end && !start) {
-          throw new Error(`Slot ${n} start is required when end is set`);
-        }
-      }
-
-      // Every configured window must have start != end.
-      for (const n of [1, 2, 3]) {
-        const start = params[`slot${n}_start`];
-        const end = params[`slot${n}_end`];
-        if (start && end && start === end) {
-          throw new Error(`Slot ${n} start and end must differ`);
+        const start = readBoundary(params, `slot${n}_start`);
+        const end = readBoundary(params, `slot${n}_end`);
+        const startSet = boundaryConfigured(start);
+        const endSet = boundaryConfigured(end);
+        if (startSet !== endSet) {
+          throw new Error(`Slot ${n} start and end must both be set`);
         }
       }
     },
@@ -329,6 +378,17 @@ export function createRecipe(): RecipeDefinition {
 
       const startTimers = new Map<number, ReturnType<typeof setTimeout>>();
       const endTimers = new Map<number, ReturnType<typeof setTimeout>>();
+      const warnedNull = new Set<string>();
+
+      /** Resolve a boundary to an "HH:MM" for today, or null when its sun time
+       *  is unavailable. Re-reads the sun each call so re-arms track the day. */
+      function resolveHHMM(b: Boundary): string | null {
+        if (b.kind === "time") return isValidHHMM(b.time) ? b.time : null;
+        const sun = ctx.helpers.getSunlight();
+        const base = b.kind === "sunrise" ? sun.sunrise : sun.sunset;
+        if (!isValidHHMM(base)) return null;
+        return applyOffset(base, b.offset);
+      }
 
       async function dispatch(value: "ON" | "OFF"): Promise<void> {
         await Promise.all(
@@ -360,55 +420,73 @@ export function createRecipe(): RecipeDefinition {
         ctx.log(`Arrêt créneau ${windowLabel(w)} (${namesOf(equipmentIds)})`);
       }
 
-      function scheduleStart(w: Window): void {
-        const delay = msUntilTime(w.start);
+      function schedule(
+        timers: Map<number, ReturnType<typeof setTimeout>>,
+        w: Window,
+        b: Boundary,
+        fire: (w: Window) => Promise<void>,
+        tag: string,
+      ): void {
+        const existing = timers.get(w.index);
+        if (existing) clearTimeout(existing);
+
+        const hhmm = resolveHHMM(b);
+        if (!hhmm) {
+          // Sun time unavailable today — will be re-armed on `sunlight.changed`.
+          const key = `${w.index}-${tag}`;
+          if (!warnedNull.has(key)) {
+            ctx.log(`Créneau ${w.index} : ${boundaryLabel(b)} indisponible aujourd'hui, borne ignorée`, "warn");
+            warnedNull.add(key);
+          }
+          timers.delete(w.index);
+          return;
+        }
+        warnedNull.delete(`${w.index}-${tag}`);
+
         const timer = setTimeout(() => {
-          fireOn(w).catch((err) =>
-            ctx.logger.error({ err, slot: w.start }, "Start fire failed"),
-          );
-          scheduleStart(w); // re-arm for tomorrow
+          fire(w).catch((err) => ctx.logger.error({ err, slot: w.index }, `${tag} fire failed`));
+          schedule(timers, w, b, fire, tag); // re-arm for the next day
           updateNextLabels();
-        }, delay);
-        startTimers.set(w.index, timer);
+        }, msUntilTime(hhmm));
+        timers.set(w.index, timer);
       }
 
-      function scheduleEnd(w: Window): void {
-        const delay = msUntilTime(w.end);
-        const timer = setTimeout(() => {
-          fireOff(w).catch((err) =>
-            ctx.logger.error({ err, slot: w.end }, "End fire failed"),
-          );
-          scheduleEnd(w); // re-arm for tomorrow
-          updateNextLabels();
-        }, delay);
-        endTimers.set(w.index, timer);
+      function armAll(): void {
+        for (const w of windows) {
+          schedule(startTimers, w, w.start, fireOn, "start");
+          schedule(endTimers, w, w.end, fireOff, "end");
+        }
+        updateNextLabels();
+      }
+
+      /** Re-resolve + re-arm boundaries that depend on the sun (their fire time
+       *  shifts day to day). Fixed-time boundaries are left as-is. */
+      function rearmSunBoundaries(): void {
+        for (const w of windows) {
+          if (w.start.kind !== "time") schedule(startTimers, w, w.start, fireOn, "start");
+          if (w.end.kind !== "time") schedule(endTimers, w, w.end, fireOff, "end");
+        }
+        updateNextLabels();
+      }
+
+      function nextHHMM(boundaries: Boundary[]): string | null {
+        const resolved = boundaries.map(resolveHHMM).filter(isValidHHMM);
+        if (resolved.length === 0) return null;
+        return resolved.sort((a, b) => msUntilTime(a) - msUntilTime(b))[0];
       }
 
       function updateNextLabels(): void {
-        if (windows.length === 0) {
-          ctx.state.set("nextStart", null);
-          ctx.state.set("nextEnd", null);
-          return;
-        }
-        const nextStart = [...windows].sort(
-          (a, b) => msUntilTime(a.start) - msUntilTime(b.start),
-        )[0].start;
-        const nextEnd = [...windows].sort(
-          (a, b) => msUntilTime(a.end) - msUntilTime(b.end),
-        )[0].end;
-        ctx.state.set("nextStart", nextStart);
-        ctx.state.set("nextEnd", nextEnd);
+        ctx.state.set("nextStart", windows.length ? nextHHMM(windows.map((w) => w.start)) : null);
+        ctx.state.set("nextEnd", windows.length ? nextHHMM(windows.map((w) => w.end)) : null);
       }
 
       // ── Initialize ──
 
       ctx.state.set("status", "idle");
       ctx.state.set("currentSlot", null);
-      for (const w of windows) {
-        scheduleStart(w);
-        scheduleEnd(w);
-      }
-      updateNextLabels();
+      armAll();
+
+      const unsub = ctx.eventBus.onType("sunlight.changed", () => rearmSunBoundaries());
 
       const labels = windows.map(windowLabel).join(", ");
       ctx.log(
@@ -421,9 +499,8 @@ export function createRecipe(): RecipeDefinition {
           for (const t of endTimers.values()) clearTimeout(t);
           startTimers.clear();
           endTimers.clear();
-
-          // Leave equipments untouched (no forced OFF): disabling an automation
-          // should not actuate devices.
+          unsub();
+          // Leave equipments untouched (no forced OFF).
           ctx.state.set("status", "idle");
           ctx.state.set("currentSlot", null);
           ctx.log("Recette arrêtée");

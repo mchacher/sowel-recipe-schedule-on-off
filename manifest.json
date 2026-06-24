@@ -2,17 +2,17 @@
   "id": "schedule-on-off",
   "type": "recipe",
   "name": "Schedule On/Off",
-  "version": "1.0.0",
-  "description": "Scheduled on/off for any on/off equipment, up to 3 daily time windows",
+  "version": "2.0.0",
+  "description": "Scheduled on/off for any on/off equipment: fixed time, sunrise or sunset, up to 3 daily windows",
   "icon": "CalendarClock",
   "repo": "mchacher/sowel-recipe-schedule-on-off",
   "author": "mchacher",
-  "tags": ["schedule", "timer", "on-off", "automation"],
+  "tags": ["schedule", "timer", "on-off", "sunrise", "sunset", "automation"],
   "i18n": {
     "fr": {
       "name": "Programmation horaire",
-      "description": "Plages horaires marche/arrêt pour des équipements on/off, jusqu'à 3 créneaux par jour"
+      "description": "Plages horaires marche/arrêt pour des équipements on/off : heure fixe, lever ou coucher du soleil, jusqu'à 3 créneaux par jour"
     }
   },
-  "sowelVersion": ">=1.3.0"
+  "sowelVersion": ">=1.23.0"
 }

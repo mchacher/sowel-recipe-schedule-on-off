@@ -1,21 +1,24 @@
 # Sowel Recipe: Schedule On/Off
 
-Scheduled on/off for any on/off equipment, up to 3 daily time windows.
+Scheduled on/off for any on/off equipment: **fixed time, sunrise or sunset**, up
+to 3 daily windows.
 
-A generic time scheduler: each window has a **start time** (turns the
-equipment(s) ON) and an **end time** (turns them OFF). The schedule runs
-**every day** and re-arms itself automatically. Windows whose end is earlier
-than their start cross midnight naturally.
-
-It is the plain-vanilla sibling of `pool-pump-schedule`: same windowed model,
-but it drives any on/off equipment in the zone instead of a single pool pump.
+Each window has a **start** (turns the equipment(s) ON) and an **end** (turns
+them OFF). Every selected equipment follows the same schedule, which runs **every
+day** and re-arms itself automatically. Windows whose end is earlier than their
+start cross midnight naturally.
 
 ## What it does
 
 - Drives **one or more** equipments on the same schedule
 - Up to **3 windows per day** (window 1 required, windows 2 and 3 optional)
+- Each boundary (start/end) is **Fixed time**, **Sunrise** or **Sunset**, with an
+  optional minute **offset** (e.g. sunset minus 15)
+- Sun times come from `ctx.helpers.getSunlight()`; the recipe re-arms its
+  sun-based timers on the `sunlight.changed` event so they track the daily drift.
+  A day with no sunrise/sunset (polar regions) skips that boundary until the sun
+  data returns
 - Fires `state = "ON"` at each start, `state = "OFF"` at each end
-- Re-arms each window for the next day after it fires
 - Exposes live state to the UI: `status` (`idle` / `running`), `currentSlot`,
   `nextStart`, `nextEnd`
 
@@ -34,15 +37,23 @@ but it drives any on/off equipment in the zone instead of a single pool pump.
 | ---- | ---- | -------- | ----- |
 | `zone` | zone | yes | Zone the equipments belong to |
 | `equipments` | equipment (list) | yes | One or more on/off equipments |
-| `slot1_start` / `slot1_end` | time | yes | Window 1 (ON / OFF) |
-| `slot2_start` / `slot2_end` | time | no | Window 2 (pair) |
-| `slot3_start` / `slot3_end` | time | no | Window 3 (pair) |
+| `slotN_start_kind` / `slotN_end_kind` | select | window 1 | Fixed time / Sunrise / Sunset |
+| `slotN_start_time` / `slotN_end_time` | time | no | Used when the kind is Fixed time |
+| `slotN_start_offset` / `slotN_end_offset` | number | no | +/- minutes, used for sunrise/sunset |
+
+The form shows only the relevant value field per boundary (the time picker for a
+fixed time, the minute offset for sunrise/sunset), via the `hiddenWhen` slot rule.
+
+## Requirements
+
+Sowel **>= 1.23.0** (the recipe uses the `select` slot type, `hiddenWhen`, and
+`ctx.helpers.getSunlight()` introduced in spec 126).
 
 ## Behaviour on disable
 
-Stopping or disabling an instance **cancels all timers and leaves the
-equipments untouched** (no forced OFF). Disabling an automation should not
-actuate devices; switch them off yourself if needed.
+Stopping or disabling an instance **cancels all timers and leaves the equipments
+untouched** (no forced OFF). Disabling an automation should not actuate devices;
+switch them off yourself if needed.
 
 ## Development
 
@@ -54,8 +65,8 @@ npm test           # vitest
 
 ## Release
 
-Tag `vX.Y.Z` to trigger the GitHub Actions release, then update the SHA256 in
-the Sowel `plugins/registry.json` with `scripts/backfill-registry-sha256.mjs`.
+Tag `vX.Y.Z` to trigger the GitHub Actions release, then update the SHA256 in the
+Sowel `plugins/registry.json` with `scripts/backfill-registry-sha256.mjs`.
 
 ## License
 
