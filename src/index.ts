@@ -143,6 +143,7 @@ const SUPPORTED_TYPES = [
   "light_color",
   "water_valve",
   "pool_pump",
+  "water_heater",
 ];
 
 const KIND_OPTIONS = [

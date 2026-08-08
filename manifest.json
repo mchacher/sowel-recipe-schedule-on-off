@@ -2,7 +2,7 @@
   "id": "schedule-on-off",
   "type": "recipe",
   "name": "Schedule On/Off",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Scheduled on/off for any on/off equipment: fixed time, sunrise or sunset, up to 3 daily windows",
   "icon": "CalendarClock",
   "repo": "mchacher/sowel-recipe-schedule-on-off",
