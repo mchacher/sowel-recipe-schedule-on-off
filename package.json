@@ -1,6 +1,6 @@
 {
   "name": "sowel-recipe-schedule-on-off",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Sowel recipe: Schedule On/Off — sun-aware (fixed time / sunrise / sunset)",
   "type": "module",
   "main": "dist/index.js",

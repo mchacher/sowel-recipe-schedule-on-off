@@ -248,3 +248,20 @@ describe("createInstance", () => {
     handle.stop();
   });
 });
+
+describe("equipments slot", () => {
+  it("accepts every on/off equipment type, including water_heater (spec 135)", () => {
+    const recipe = createRecipe();
+    const slot = recipe.slots.find((s) => s.id === "equipments");
+    expect(slot).toBeDefined();
+    expect(slot?.constraints?.equipmentType).toEqual([
+      "switch",
+      "light_onoff",
+      "light_dimmable",
+      "light_color",
+      "water_valve",
+      "pool_pump",
+      "water_heater",
+    ]);
+  });
+});
