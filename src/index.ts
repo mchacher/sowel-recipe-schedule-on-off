@@ -90,11 +90,6 @@ interface RecipeStateStore {
 
 interface EquipmentManager {
   getById(id: string): Equipment | null;
-  executeOrder(
-    equipmentId: string,
-    alias: string,
-    value: unknown,
-  ): Promise<{ success: boolean; error?: string }>;
 }
 
 interface Sunlight {
@@ -115,6 +110,13 @@ interface RecipeContext {
   };
   state: RecipeStateStore;
   log: (message: string, level?: "info" | "warn" | "error") => void;
+  // Spec 101 — dispatches an order attributed to this recipe instance, so the
+  // activity feed names the recipe as its source.
+  dispatchOrder(
+    equipmentId: string,
+    alias: string,
+    value: unknown,
+  ): Promise<{ success: boolean; error?: string }>;
   helpers: { parseDuration(value: unknown): number; getSunlight(): Sunlight };
 }
 
@@ -395,7 +397,7 @@ export function createRecipe(): RecipeDefinition {
         await Promise.all(
           equipmentIds.map(async (id) => {
             try {
-              const res = await ctx.equipmentManager.executeOrder(id, "state", value);
+              const res = await ctx.dispatchOrder(id, "state", value);
               if (res && res.success === false) {
                 ctx.log(`Erreur ${value} ${nameOf(id)} : ${res.error ?? "échec"}`, "error");
               }
