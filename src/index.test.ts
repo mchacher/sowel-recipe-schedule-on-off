@@ -24,10 +24,10 @@ function buildCtx(initialSun: Sun = { sunrise: "06:00", sunset: "21:00", isDayli
     },
     equipmentManager: {
       getById: (id: string) => ({ id, name: id, type: "switch" }),
-      executeOrder: async (equipmentId: string, alias: string, value: unknown) => {
-        orderCalls.push({ equipmentId, alias, value });
-        return { success: true };
-      },
+    },
+    dispatchOrder: async (equipmentId: string, alias: string, value: unknown) => {
+      orderCalls.push({ equipmentId, alias, value });
+      return { success: true };
     },
     zoneManager: { getById: () => null },
     logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
